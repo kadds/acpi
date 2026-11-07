@@ -5,6 +5,7 @@
 pub mod check_cmd_handler;
 pub mod listed_response_handler;
 pub mod logging_handler;
+pub mod native_region_handler;
 pub mod null_handler;
 pub mod std_test_handler;
 pub mod sys_timer_handler;

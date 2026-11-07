@@ -19,7 +19,7 @@ use aml_test_tools::{
         null_handler::NullHandler,
         sys_timer_handler::SystemTimerHandler,
     },
-    new_interpreter,
+    new_interpreter_with_native_regions,
     resolve_and_compile,
     result::ExpectedResult,
     CompilationOutcome,
@@ -200,7 +200,7 @@ If the ASL contains a MAIN method, it will be executed.",
         .collect::<Vec<_>>();
 
     let combined_test = matches.get_flag("combined");
-    let mut interpreter = new_interpreter(new_handler());
+    let mut interpreter = new_interpreter_with_native_regions(new_handler(), Default::default());
 
     for file_entry in aml_files {
         print!("Testing AML file: {:?}... ", file_entry);
@@ -238,8 +238,8 @@ If the ASL contains a MAIN method, it will be executed.",
         }
 
         interpreter = match interpreter_returned {
-            _ if !combined_test => new_interpreter(new_handler()),
-            None => new_interpreter(new_handler()),
+            _ if !combined_test => new_interpreter_with_native_regions(new_handler(), Default::default()),
+            None => new_interpreter_with_native_regions(new_handler(), Default::default()),
             Some(i) => i,
         };
 

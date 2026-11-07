@@ -1,134 +1,242 @@
-//! Test the ACPI Global Lock mechanism.
+//! Verify that AML Global Lock operations use the host-owned lock protocol.
 
-// These tests make use of `serial_test` as the test infra creates one firmware lock and then uses
-// it for all tests - which causes these tests of the locking mechanism to conflict with each other
-// when run in parallel.
-
-use acpi::{Handle, Handler, RawPhysicalMapping, aml::AmlError};
-use aml_test_tools::new_interpreter;
+use acpi::{
+    Handle,
+    Handler,
+    RawPhysicalMapping,
+    aml::{
+        AmlError,
+        Interpreter,
+        op_region::{NativeRegionAccessMode, NativeRegionHandler, NativeRegionToken, OpRegion},
+    },
+};
+use aml_test_tools::new_interpreter_with_native_regions;
 use lock_api::RawReentrantMutex;
 use parking_lot::{RawMutex, RawThreadId};
 use pci_types::PciAddress;
-use serial_test::serial;
 use std::{
+    str::FromStr,
     sync::{
         Arc,
-        Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
-    thread,
     time::Duration,
 };
 
-mod test_infra;
-
 #[test]
-#[serial]
-fn uncontended_acquire_release() {
-    let interpreter = new_interpreter(LockHandler::new());
-
-    interpreter.acquire_global_lock(0).expect("Failed to acquire lock");
-    interpreter.release_global_lock().expect("Failed to release lock");
+fn global_lock_operations_use_the_host_protocol_and_are_reentrant() {
+    let interpreter = new_interpreter_with_native_regions(LockHandler::new(), Vec::new());
+    interpreter.acquire_global_lock(0).expect("first global-lock acquire");
+    interpreter.acquire_global_lock(0).expect("recursive global-lock acquire");
+    assert!(interpreter.has_global_lock_dependency());
+    interpreter.release_global_lock().expect("release recursive acquire");
+    interpreter.release_global_lock().expect("release hardware acquire");
+    assert!(matches!(
+        interpreter.release_global_lock(),
+        Err(AmlError::HostError(message)) if message == "NOT_ACQUIRED_GLOBAL_LOCK"
+    ));
 }
 
 #[test]
-#[serial]
-fn single_thread_acquire_release() {
-    let interpreter = new_interpreter(LockHandler::new());
-
-    interpreter.acquire_global_lock(0).expect("Failed to acquire lock (1)");
-    interpreter.acquire_global_lock(0).expect("Failed to acquire lock (2)");
-    interpreter.release_global_lock().expect("Failed to release lock (2)");
-    interpreter.release_global_lock().expect("Failed to release lock (1)");
+fn aml_acquire_release_executes_through_the_global_lock_handler() {
+    let interpreter = new_interpreter_with_native_regions(LockHandler::new(), Vec::new());
+    let aml = [
+        // Method (MAIN, 0) {
+        //     Acquire (\\_GL_, 0); Release (\\_GL_); Return (0x2a)
+        // }
+        0x14, 0x19, b'M', b'A', b'I', b'N', 0x00, 0x5b, 0x23, 0x5c, b'_', b'G', b'L', b'_', 0x00, 0x00, 0x5b, 0x27,
+        0x5c, b'_', b'G', b'L', b'_', 0xa4, 0x0a, 0x2a,
+    ];
+    interpreter.load_table(&aml).expect("Global Lock AML should parse");
+    let result = interpreter
+        .evaluate(acpi::aml::namespace::AmlName::from_str("\\MAIN").unwrap(), Vec::new())
+        .expect("AML Acquire/Release should use the host Global Lock");
+    assert_eq!(result.as_integer().unwrap(), 0x2a);
 }
 
 #[test]
-#[serial]
-fn multi_thread_acquire_release() {
-    // Steps in order (threads are labeled A & B):
-    // 1: A acquires lock
-    // 2: B attempts to acquire lock, fails
-    // 3: A waits for B to complete #2.
-    // 4: A releases lock
-    // 5: B waits for A to release lock and acquires lock successfully.
+fn aml_acquire_returns_false_on_success_and_true_on_timeout() {
+    for (timeout, expected) in [(false, 0), (true, u64::MAX)] {
+        let callbacks = Arc::new(GlobalLockCallbacks::new(timeout));
+        let interpreter = interpreter_with_callbacks(Arc::clone(&callbacks));
+        let aml = method_table(
+            *b"MAIN",
+            &[
+                0xa4, // Return
+                0x5b, 0x23, // Acquire
+                0x5c, b'_', b'G', b'L', b'_', // \_GL_
+                0x00, 0x00, // timeout = 0 ms
+            ],
+        );
+        interpreter.load_table(&aml).expect("Acquire expression should parse");
 
-    let handler = LockHandler::new();
-    let interpreter = new_interpreter(handler.clone());
-
-    let barrier = Barrier::new(2);
-
-    let success = AtomicBool::new(false);
-
-    // 1: A acquires the lock
-    interpreter.acquire_global_lock(0).expect("1: A failed to acquire lock");
-    thread::scope(|s| {
-        s.spawn(|| {
-            let interpreter = new_interpreter(handler);
-
-            // 2: B attempts to acquire lock, fails.
-            let e = interpreter.acquire_global_lock(0).expect_err("2: B managed to acquire lock!");
-            assert!(matches!(e, AmlError::MutexAcquireTimeout));
-
-            // 3: A waits for B to complete #2
-            barrier.wait();
-            // 4: Occurs in thread A (the main thread)
-
-            // 5: B attempts to acquire lock, waiting as needed.
-            interpreter.acquire_global_lock(10000).expect("5: B failed to acquire lock");
-
-            success.store(true, Ordering::Relaxed);
-
-            interpreter.release_global_lock().expect("B: Failed to release global lock");
-        });
-
-        // 3: A waits for B to complete #2
-        barrier.wait();
-
-        // 4: A releases the global lock
-        interpreter.release_global_lock().expect("Failed to release global lock");
-    });
-
-    // Check that B acquired lock successfully
-    assert!(success.load(Ordering::Relaxed));
+        let result = interpreter
+            .evaluate(acpi::aml::namespace::AmlName::from_str("\\MAIN").unwrap(), Vec::new())
+            .expect("Acquire returns its timeout result to AML");
+        assert_eq!(result.as_integer().expect("Acquire result is an integer Boolean"), expected);
+        assert_eq!(callbacks.acquire_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            callbacks.release_count.load(Ordering::Relaxed),
+            usize::from(!timeout),
+            "a successful lock held at method return must be released"
+        );
+    }
 }
 
 #[test]
-#[serial]
-fn uacpi_global_lock_test() {
-    // This test is adapted from the uACPI test file `tests/test-cases/global-lock.asl`
-    const AML: &str = r#"
-DefinitionBlock ("", "DSDT", 2, "uTEST", "TESTTABL", 0xF0F0F0F0)
-{
-    Method (CHEK, 1, Serialized, 15)
-    {
-        If (Arg0 != 0) {
-            Debug = "Failed to acquire the global lock!"
-            Return (1)
+fn uncertain_global_lock_acquire_poison_prevents_following_aml_work() {
+    let callbacks = Arc::new(GlobalLockCallbacks::unknown());
+    let interpreter = interpreter_with_callbacks(Arc::clone(&callbacks));
+    let aml = method_table(
+        *b"MAIN",
+        &[
+            0xa4, // Return
+            0x5b, 0x23, // Acquire
+            0x5c, b'_', b'G', b'L', b'_', // \_GL_
+            0x00, 0x00,
+        ],
+    );
+    interpreter.load_table(&aml).expect("Acquire expression should parse");
+    let path = acpi::aml::namespace::AmlName::from_str("\\MAIN").unwrap();
+
+    assert!(matches!(interpreter.evaluate(path.clone(), Vec::new()), Err(AmlError::GlobalLockOutcomeUnknown)));
+    assert!(matches!(interpreter.evaluate(path, Vec::new()), Err(AmlError::GlobalLockOutcomeUnknown)));
+    assert_eq!(callbacks.acquire_count.load(Ordering::Relaxed), 1);
+    assert_eq!(callbacks.release_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn aml_method_error_releases_global_lock_acquisitions_from_that_method() {
+    let callbacks = Arc::new(GlobalLockCallbacks::new(false));
+    let interpreter = interpreter_with_callbacks(Arc::clone(&callbacks));
+    let aml = method_table(
+        *b"MAIN",
+        &[
+            0x5b, 0x23, // Acquire
+            0x5c, b'_', b'G', b'L', b'_', // \_GL_
+            0x00, 0x00, // timeout = 0 ms
+            0x78, // Divide (1, 0, NullName, NullName)
+            0x0a, 0x01, // ByteConst(1)
+            0x00, // Zero
+            0x00, // NullName target for remainder
+            0x00, // NullName target for quotient
+            0xa4, 0x00, // Return(Zero)
+        ],
+    );
+    interpreter.load_table(&aml).expect("erroring method should parse");
+
+    let result = interpreter.evaluate(acpi::aml::namespace::AmlName::from_str("\\MAIN").unwrap(), Vec::new());
+    assert!(matches!(result, Err(AmlError::DivisionByZero)));
+    assert_eq!(callbacks.acquire_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        callbacks.release_count.load(Ordering::Relaxed),
+        1,
+        "method failure must unwind locks acquired by the failed method"
+    );
+}
+
+fn interpreter_with_callbacks(callbacks: Arc<GlobalLockCallbacks>) -> Interpreter<LockHandler> {
+    let interpreter = Interpreter::new(LockHandler::new(), 2);
+    interpreter.install_native_region_handler(Box::new(RecordingNativeRegionHandler { callbacks }));
+    interpreter
+}
+
+fn method_table(name: [u8; 4], body: &[u8]) -> Vec<u8> {
+    let package_length = 1 + 4 + 1 + body.len();
+    assert!(package_length < 0x40, "test AML uses one-byte PkgLength");
+    let mut aml = Vec::with_capacity(package_length + 1);
+    aml.extend_from_slice(&[0x14, package_length as u8]);
+    aml.extend_from_slice(&name);
+    aml.push(0);
+    aml.extend_from_slice(body);
+    aml
+}
+
+struct GlobalLockCallbacks {
+    timeout: bool,
+    unknown: bool,
+    acquire_count: AtomicUsize,
+    release_count: AtomicUsize,
+}
+
+impl GlobalLockCallbacks {
+    fn new(timeout: bool) -> Self {
+        Self { timeout, unknown: false, acquire_count: AtomicUsize::new(0), release_count: AtomicUsize::new(0) }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            timeout: false,
+            unknown: true,
+            acquire_count: AtomicUsize::new(0),
+            release_count: AtomicUsize::new(0),
         }
-
-        Return (0)
-    }
-
-    Method (MAIN, 0, Serialized)
-    {
-        Local0 = 0
-
-        Local0 += CHEK(Acquire (_GL, 0xFFFF))
-        Local0 += CHEK(Acquire (_GL, 0xFFFF))
-        Local0 += CHEK(Acquire (_GL, 0xFFFF))
-        Local0 += CHEK(Acquire (_GL, 0xFFFF))
-
-        Release(_GL)
-        Release(_GL)
-        Release(_GL)
-        Release(_GL)
-
-        Return (Local0)
     }
 }
-"#;
-    let handler = LockHandler::new();
-    test_infra::run_aml_test(AML, handler);
+
+struct RecordingNativeRegionHandler {
+    callbacks: Arc<GlobalLockCallbacks>,
+}
+
+impl NativeRegionHandler for RecordingNativeRegionHandler {
+    fn authorize(&self, region: &OpRegion, _mode: NativeRegionAccessMode) -> Result<NativeRegionToken, AmlError> {
+        Ok(NativeRegionToken::new(region.clone()))
+    }
+
+    fn read(&self, _token: &NativeRegionToken, _offset: usize, _length: usize) -> Result<u64, AmlError> {
+        Err(AmlError::HostError("UNUSED_TEST_REGION_READ".to_string()))
+    }
+
+    fn write(
+        &self,
+        _token: &NativeRegionToken,
+        _offset: usize,
+        _length: usize,
+        _value: u64,
+    ) -> Result<(), AmlError> {
+        Err(AmlError::HostError("UNUSED_TEST_REGION_WRITE".to_string()))
+    }
+
+    fn acquire_global_lock(&self, _timeout_us: u64) -> Result<(), AmlError> {
+        self.callbacks.acquire_count.fetch_add(1, Ordering::Relaxed);
+        if self.callbacks.timeout {
+            Err(AmlError::MutexAcquireTimeout)
+        } else if self.callbacks.unknown {
+            Err(AmlError::GlobalLockOutcomeUnknown)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn release_global_lock(&self) -> Result<(), AmlError> {
+        self.callbacks.release_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn execution_thread_id(&self) -> Option<u64> {
+        Some(1)
+    }
+}
+
+#[test]
+fn locked_field_reads_under_the_global_lock() {
+    let interpreter = new_interpreter_with_native_regions(LockHandler::new(), Vec::new());
+    let aml = [
+        // OperationRegion (REG0, SystemMemory, 0, 1)
+        0x5b, 0x80, b'R', b'E', b'G', b'0', 0x00, 0x0c, 0, 0, 0, 0, 0x0c, 1, 0, 0, 0,
+        // Field (REG0, AnyAcc, Lock, Preserve) { DATA, 8 }
+        0x5b, 0x81, 0x0b, b'R', b'E', b'G', b'0', 0x10, b'D', b'A', b'T', b'A', 0x08,
+        // Method (MAIN, 0) { Return (DATA) }
+        0x14, 0x0b, b'M', b'A', b'I', b'N', 0x00, 0xa4, b'D', b'A', b'T', b'A',
+    ];
+    interpreter.load_table(&aml).expect("locked field AML should parse");
+    interpreter.initialize_native_regions().expect("native region setup");
+
+    let value = interpreter
+        .evaluate(acpi::aml::namespace::AmlName::from_str("\\MAIN").unwrap(), vec![])
+        .expect("LockRule=Lock field access should use the host Global Lock");
+    assert_eq!(value.as_integer().expect("locked field returns integer"), 0);
+    assert!(interpreter.has_global_lock_dependency());
 }
 
 #[derive(Clone)]
@@ -188,7 +296,7 @@ impl Handler for LockHandler {
     }
 
     fn read_u8(&self, _address: usize) -> u8 {
-        unimplemented!()
+        0
     }
 
     fn read_u16(&self, _address: usize) -> u16 {

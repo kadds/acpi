@@ -16,5 +16,11 @@ DefinitionBlock("", "DSDT", 1, "RSACPI", "UACPI", 1) {
 }"#;
 
     let r = test_infra::run_aml_test_with_result(ASL, NullHandler);
-    assert_matches!(r, RunTestResult::Failed(_, TestFailureReason::ParseFail(AmlError::MethodStackExceeded)));
+    assert_matches!(
+        r,
+        RunTestResult::Failed(
+            _,
+            TestFailureReason::ParseFail(AmlError::MethodStackExceeded | AmlError::BudgetExceeded)
+        )
+    );
 }

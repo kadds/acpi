@@ -7,7 +7,7 @@ use crate::aml::{
     object::Object,
     resource::{self, InterruptPolarity, InterruptTrigger, Irqs, Resource},
 };
-use alloc::{vec, vec::Vec};
+use super::allocator::{self, Arc, Vec};
 use bit_field::BitField;
 use core::str::FromStr;
 
@@ -99,9 +99,9 @@ impl PciRoutingTable {
         prt_path: AmlName,
         interpreter: &Interpreter<impl Handler>,
     ) -> Result<PciRoutingTable, AmlError> {
-        let mut entries = Vec::new();
+        let mut entries = allocator::vec_new();
 
-        let prt = interpreter.evaluate(prt_path.clone(), vec![])?;
+        let prt = interpreter.evaluate(prt_path.clone(), crate::aml_vec![])?;
 
         if let Object::Package(ref inner_values) = *prt {
             for value in inner_values {
@@ -145,7 +145,7 @@ impl PciRoutingTable {
                      * also accept a string, as that is how names in packages used to be
                      * represented, and some tables store the path as a string themselves.
                      */
-                    let source = pin_package[2].clone().unwrap_reference();
+                    let source = pin_package[2].clone().unwrap_reference()?;
                     let link_object_name = match *source {
                         /*
                          * A `Source` of a single NameSeg is subject to the namespace search rules,
@@ -230,9 +230,13 @@ impl PciRoutingTable {
             }),
             PciRouteType::LinkObject(ref name) => {
                 let path = AmlName::from_str("_CRS").unwrap().resolve(name)?;
-                let link_crs = interpreter.evaluate(path, vec![])?;
+                let link_crs = interpreter.evaluate(path, crate::aml_vec![])?;
 
-                let resources = resource::resource_descriptor_list(link_crs)?;
+                let execution_meter = interpreter.execution_meter.lock().as_ref().map(Arc::clone);
+                let resources = match execution_meter.as_ref() {
+                    Some(meter) => resource::resource_descriptor_list_metered(link_crs, meter.as_ref())?,
+                    None => resource::resource_descriptor_list(link_crs)?,
+                };
                 match resources.as_slice() {
                     [Resource::Irq(descriptor)] => Ok(descriptor.clone()),
                     _ => Err(AmlError::UnexpectedResourceType),

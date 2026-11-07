@@ -1,4 +1,3 @@
-#![feature(sync_unsafe_cell)]
 //! A collection of helper utilities for testing AML using the [`acpi`] crate.
 //!
 //! These utilities are very heavily based on the way the [`acpi`] crate has used them historically.
@@ -10,20 +9,18 @@ pub mod result;
 pub mod tables;
 
 use crate::{
+    handlers::native_region_handler::TestNativeRegionHandler,
     result::{ExpectedResult, result_matches},
     tables::{TestAcpiTable, bytes_to_tables},
 };
 use acpi::{
     Handler,
-    PhysicalMapping,
-    RawPhysicalMapping,
-    address::MappedGas,
     aml::{AmlError, Interpreter, namespace::AmlName},
-    sdt::{SdtHeader, Signature, facs::Facs},
+    sdt::{SdtHeader, Signature},
 };
 use log::{error, trace};
+use pci_types::PciAddress;
 use std::{
-    cell::SyncUnsafeCell,
     ffi::OsStr,
     fmt::{Debug, Formatter},
     fs::File,
@@ -31,9 +28,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     process::Command,
-    ptr::NonNull,
     str::FromStr,
-    sync::{Arc, atomic::AtomicU32},
 };
 use tempfile::{NamedTempFile, TempDir, tempdir};
 
@@ -208,89 +203,33 @@ pub fn resolve_and_compile(path: &PathBuf, can_compile: bool) -> CompilationOutc
 
 /// Construct a new [interpreter](Interpreter) to use for testing.
 ///
-/// This interpreter uses some simple fake registers and FACS to facilitate testing. It is not
-/// mandatory to use this interpreter for testing when using other functions in this crate.
+/// This interpreter installs no FACS or fixed-register mapping. It is not mandatory to use this
+/// interpreter for testing when using other functions in this crate.
 ///
 /// Arguments:
 ///
 /// * `handler`: The Handler to be called by the interpreter when needed. This crate includes some
 ///   example [handlers].
-///
-/// Thread safety:
-///
-/// This function uses a single, static, FACS for all tests. If tests are run in parallel, this
-/// means they will share a single global lock.
 pub fn new_interpreter<T>(handler: T) -> Interpreter<T>
 where
-    T: Handler + Clone,
+    T: Handler,
 {
-    let fake_registers = Arc::new(acpi::registers::FixedRegisters {
-        pm1_event_registers: acpi::registers::Pm1EventRegisterBlock {
-            pm1_event_length: 8,
-            pm1a: unsafe {
-                MappedGas::map_gas(
-                    acpi::address::GenericAddress {
-                        address_space: acpi::address::AddressSpace::SystemIo,
-                        bit_width: 32,
-                        bit_offset: 0,
-                        access_size: 1,
-                        address: 0x400,
-                    },
-                    handler.clone(),
-                )
-                .unwrap()
-            },
-            pm1b: None,
-        },
-        pm1_control_registers: acpi::registers::Pm1ControlRegisterBlock {
-            pm1a: unsafe {
-                MappedGas::map_gas(
-                    acpi::address::GenericAddress {
-                        address_space: acpi::address::AddressSpace::SystemIo,
-                        bit_width: 32,
-                        bit_offset: 0,
-                        access_size: 1,
-                        address: 0x600,
-                    },
-                    handler.clone(),
-                )
-                .unwrap()
-            },
-            pm1b: None,
-        },
-    });
+    Interpreter::new(handler, 2)
+}
 
-    // As noted in the doc-comment, this Facs is shared between all tests - so if tests are run in
-    // parallel, they will share a single global lock.
-    //
-    // This construct is needed because the FACS in a real system is effectively 'static, and the
-    // interpreter relies on that.
-    static FAKE_FACS: SyncUnsafeCell<Facs> = SyncUnsafeCell::new(Facs {
-        signature: Signature::FACS,
-        length: size_of::<Facs>() as u32,
-        hardware_signature: 0,
-        firmware_waking_vector: 0,
-        global_lock: AtomicU32::new(0),
-        flags: 0,
-        x_firmware_waking_vector: 0,
-        version: 2,
-        _reserved0: [0; 3],
-        ospm_flags: 0,
-        reserved1: [0; 24],
-    });
-
-    let fake_facs_ptr = FAKE_FACS.get();
-
-    // This PhysicalMapping is dropped when the interpreter is dropped, and if you use logging in
-    // the handler object you'll see a call to Handler::unmap_physical_region without any
-    // corresponding call to Interpreter::map_physical_region.
-    let fake_facs_mapping = unsafe {
-        PhysicalMapping::new_unchecked(
-            RawPhysicalMapping::new(0x0, NonNull::new(fake_facs_ptr).unwrap(), 32, 32),
-            handler.clone(),
-        )
-    };
-    Interpreter::new(handler, 2, fake_registers, Some(fake_facs_mapping))
+/// Construct an interpreter with the explicit native-region adapter used by
+/// AML execution tests. The ordinary `new_interpreter` keeps native access
+/// fail-closed for tests that exercise admission behavior directly.
+pub fn new_interpreter_with_native_regions<T>(
+    handler: T,
+    pci_devices: Vec<(AmlName, PciAddress)>,
+) -> Interpreter<T>
+where
+    T: Handler + Send + Sync + 'static,
+{
+    let interpreter = Interpreter::new(handler.clone(), 2);
+    interpreter.install_native_region_handler(Box::new(TestNativeRegionHandler::new(handler, pci_devices)));
+    interpreter
 }
 
 /// Test an ASL script given as a string, using [`run_test`].
@@ -456,6 +395,10 @@ where
             );
             interpreter.load_table(t.content())?;
         }
+
+        interpreter.evaluate_if_present(AmlName::from_str("\\_INI").unwrap(), vec![])?;
+        interpreter.evaluate_if_present(AmlName::from_str("\\_SB._INI").unwrap(), vec![])?;
+        interpreter.initialize_native_regions()?;
 
         trace!("All tables loaded");
 

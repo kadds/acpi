@@ -1,12 +1,9 @@
-use alloc::vec;
-use core::str::FromStr;
 
 use crate::{
     Handler,
     aml::{
         AmlError,
         BaseInterpreter,
-        namespace::AmlName,
         object::{Object, WrappedObject},
         op_region::RegionHandler,
     },
@@ -49,13 +46,11 @@ where
     R: RegionHandler + ?Sized,
 {
     /// Calls the [`\_PIC` method](https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html#pic-method).
-    /// The method is optional, so if it doesn't exist this function returns success. Returns `true` is the method was called, `false` if it doesn't exist.
+    /// The method is optional. Once the one-shot `_PIC` decision completes,
+    /// `_PRT` evaluation is enabled. Returns `true` if the method existed.
     pub fn set_interrupt_model_used(&self, model: InterruptModelUsed) -> Result<bool, AmlError> {
-        Ok(self
-            .evaluate_if_present(
-                AmlName::from_str(r#"\_PIC"#).expect("valid name"),
-                vec![WrappedObject::new(model.into())],
-            )?
-            .is_some())
+        let result = self.evaluate_pic_once(crate::aml_vec![WrappedObject::new(model.into())])?;
+        self.enable_routing_methods();
+        Ok(result.is_some())
     }
 }

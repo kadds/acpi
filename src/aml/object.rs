@@ -1,15 +1,23 @@
-use crate::aml::{AmlError, Handle, IntegerSize, Operation, namespace::AmlName, op_region::OpRegion};
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
+use crate::aml::{
+    AmlError,
+    ExecutionMeter,
+    Handle,
+    IntegerSize,
+    Operation,
+    namespace::AmlName,
+    op_region::OpRegion,
 };
+use super::allocator::{self, Arc, Box, String, Vec};
+use alloc::string::ToString;
 use bit_field::BitField;
 use core::{cell::UnsafeCell, cmp::Ordering, fmt, ops, sync::atomic::AtomicU64};
 use static_assertions::assert_impl_all;
 
-type NativeMethod = dyn Fn(&[WrappedObject]) -> Result<WrappedObject, AmlError> + Send + Sync;
+type NativeMethod =
+    dyn Fn(&[WrappedObject], Option<Arc<dyn ExecutionMeter>>) -> Result<WrappedObject, AmlError> + Send + Sync;
+
+const MAX_REFERENCE_STORE_DEPTH: usize = 256;
+const MAX_REFERENCE_GRAPH_NODES: usize = 65_536;
 
 pub type Package = Vec<WrappedObject>;
 
@@ -42,9 +50,19 @@ impl Object {
     where
         F: Fn(&[WrappedObject]) -> Result<WrappedObject, AmlError> + 'static + Send + Sync,
     {
+        Self::native_method_metered(num_args, move |args, _meter| f(args))
+    }
+
+    pub fn native_method_metered<F>(num_args: u8, f: F) -> Object
+    where
+        F: Fn(&[WrappedObject], Option<Arc<dyn ExecutionMeter>>) -> Result<WrappedObject, AmlError>
+            + 'static
+            + Send
+            + Sync,
+    {
         let mut flags = 0;
         flags.set_bits(0..3, num_args);
-        Object::NativeMethod { f: Arc::new(f), flags: MethodFlags(flags) }
+        Object::NativeMethod { f: allocator::arc_new(f), flags: MethodFlags(flags) }
     }
 }
 
@@ -111,15 +129,170 @@ impl ObjectToken {
 assert_impl_all!(Object: Send, Sync);
 
 #[derive(Clone, Debug)]
-pub struct WrappedObject(Arc<UnsafeCell<Object>>);
+pub struct WrappedObject(Arc<WrappedObjectInner>);
+
+pub(crate) trait ObjectHeapReservation: fmt::Debug + Send {
+    fn commit_to_persistent(&mut self) -> Result<(), AmlError>;
+}
+
+#[derive(Debug)]
+struct WrappedObjectInner {
+    object: UnsafeCell<Object>,
+    cell_heap_reservation: UnsafeCell<Option<Box<dyn ObjectHeapReservation>>>,
+    heap_reservation: UnsafeCell<Option<Box<dyn ObjectHeapReservation>>>,
+}
+
+pub(crate) fn wrapped_object_inner_heap_bytes() -> Option<usize> {
+    core::mem::size_of::<WrappedObjectInner>().checked_add(2 * core::mem::size_of::<usize>())?.checked_add(24)
+}
+
+pub(crate) struct MeteredObject {
+    pub(crate) object: Object,
+    pub(crate) heap_reservation: Option<Box<dyn ObjectHeapReservation>>,
+}
 
 unsafe impl Send for WrappedObject {}
 unsafe impl Sync for WrappedObject {}
 
 impl WrappedObject {
     pub fn new(object: Object) -> WrappedObject {
+        Self::new_metered(object, None, None)
+    }
+
+    pub(crate) fn new_metered(
+        object: Object,
+        cell_heap_reservation: Option<Box<dyn ObjectHeapReservation>>,
+        heap_reservation: Option<Box<dyn ObjectHeapReservation>>,
+    ) -> WrappedObject {
         #[allow(clippy::arc_with_non_send_sync)]
-        WrappedObject(Arc::new(UnsafeCell::new(object)))
+        WrappedObject(allocator::arc_new(WrappedObjectInner {
+            object: UnsafeCell::new(object),
+            cell_heap_reservation: UnsafeCell::new(cell_heap_reservation),
+            heap_reservation: UnsafeCell::new(heap_reservation),
+        }))
+    }
+
+    pub(crate) fn attach_heap_reservation(
+        &self,
+        reservation: Box<dyn ObjectHeapReservation>,
+    ) -> Result<(), AmlError> {
+        let slot = unsafe { &mut *self.0.heap_reservation.get() };
+        if slot.is_some() {
+            return Err(AmlError::InternalError("object heap reservation already attached".to_string()));
+        }
+        *slot = Some(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn commit_heap_reservation(&self, _token: &ObjectToken) -> Result<(), AmlError> {
+        let mut ancestors = [core::ptr::null(); super::MAX_AML_CONTEXT_STACK_DEPTH];
+        self.commit_heap_reservation_recursive(&mut ancestors, 0)
+    }
+
+    /// Check whether storing this object's reference graph at `target` would
+    /// create a strong Arc cycle. Package and reference values can otherwise
+    /// retain their own destination indefinitely.
+    pub(crate) fn would_create_reference_cycle(
+        &self,
+        target: &WrappedObject,
+        meter: Option<&Arc<dyn ExecutionMeter>>,
+    ) -> Result<bool, AmlError> {
+        let mut ancestors = [core::ptr::null(); MAX_REFERENCE_STORE_DEPTH];
+        let mut visited_nodes = 0;
+        Self::reference_graph_contains_target(self, target, meter, &mut ancestors, 0, &mut visited_nodes)
+    }
+
+    fn reference_graph_contains_target(
+        current: &WrappedObject,
+        target: &WrappedObject,
+        meter: Option<&Arc<dyn ExecutionMeter>>,
+        ancestors: &mut [*const WrappedObjectInner; MAX_REFERENCE_STORE_DEPTH],
+        depth: usize,
+        visited_nodes: &mut usize,
+    ) -> Result<bool, AmlError> {
+        if depth != 0 && Arc::ptr_eq(&current.0, &target.0) {
+            return Ok(true);
+        }
+        *visited_nodes = visited_nodes.checked_add(1).ok_or(AmlError::BudgetExceeded)?;
+        if *visited_nodes > MAX_REFERENCE_GRAPH_NODES {
+            return Err(AmlError::BudgetExceeded);
+        }
+        if let Some(meter) = meter {
+            meter.loop_iteration()?;
+            meter.check_deadline()?;
+        }
+        if ancestors[..depth].contains(&Arc::as_ptr(&current.0)) {
+            return Ok(false);
+        }
+        if depth >= ancestors.len() {
+            return Err(AmlError::BudgetExceeded);
+        }
+        ancestors[depth] = Arc::as_ptr(&current.0);
+        let child_depth = depth + 1;
+        match &**current {
+            Object::Reference { inner, .. } | Object::BufferField { buffer: inner, .. } => {
+                Self::reference_graph_contains_target(inner, target, meter, ancestors, child_depth, visited_nodes)
+            }
+            Object::Package(elements) => {
+                for element in elements {
+                    if Self::reference_graph_contains_target(
+                        element,
+                        target,
+                        meter,
+                        ancestors,
+                        child_depth,
+                        visited_nodes,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn commit_heap_reservation_recursive(
+        &self,
+        ancestors: &mut [*const WrappedObjectInner; super::MAX_AML_CONTEXT_STACK_DEPTH],
+        depth: usize,
+    ) -> Result<(), AmlError> {
+        let current = Arc::as_ptr(&self.0);
+        if ancestors[..depth].contains(&current) {
+            return Ok(());
+        }
+        if depth == ancestors.len() {
+            return Err(AmlError::BudgetExceeded);
+        }
+        ancestors[depth] = current;
+
+        for reservation in
+            [unsafe { &mut *self.0.cell_heap_reservation.get() }, unsafe { &mut *self.0.heap_reservation.get() }]
+        {
+            if let Some(reservation) = reservation {
+                reservation.commit_to_persistent()?;
+            }
+        }
+
+        match &**self {
+            Object::BufferField { buffer, .. } | Object::Reference { inner: buffer, .. } => {
+                buffer.commit_heap_reservation_recursive(ancestors, depth + 1)?;
+            }
+            Object::Package(elements) => {
+                for element in elements {
+                    element.commit_heap_reservation_recursive(ancestors, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn replace_metered(&self, value: MeteredObject, _token: &ObjectToken) {
+        unsafe {
+            *self.0.object.get() = value.object;
+            *self.0.heap_reservation.get() = value.heap_reservation;
+        }
     }
 
     /// Gain a mutable reference to an [`Object`] from this [`WrappedObject`].
@@ -135,31 +308,48 @@ impl WrappedObject {
         't: 'r,
         'a: 'r,
     {
-        unsafe { &mut *(self.0.get()) }
+        unsafe { &mut *self.0.object.get() }
     }
 
-    pub fn unwrap_reference(self) -> WrappedObject {
-        let mut object = self;
-        loop {
-            if let Object::Reference { ref inner, .. } = *object {
-                object = inner.clone();
-            } else {
-                return object.clone();
-            }
-        }
+    pub fn unwrap_reference(self) -> Result<WrappedObject, AmlError> {
+        self.unwrap_reference_with(|_| true)
     }
 
     /// Unwraps 'transparent' references (e.g. locals, arguments, and internal usage of reference-type objects), but maintain 'real'
     /// references deliberately created by AML.
-    pub fn unwrap_transparent_reference(self) -> WrappedObject {
+    pub fn unwrap_transparent_reference(self) -> Result<WrappedObject, AmlError> {
+        self.unwrap_reference_with(|kind| {
+            matches!(
+                kind,
+                ReferenceKind::Local | ReferenceKind::Arg | ReferenceKind::Named | ReferenceKind::ImmutableNamed
+            )
+        })
+    }
+
+    fn unwrap_reference_with(
+        self,
+        should_unwrap: impl Fn(ReferenceKind) -> bool,
+    ) -> Result<WrappedObject, AmlError> {
         let mut object = self;
+        let mut visited = [core::ptr::null(); MAX_REFERENCE_STORE_DEPTH];
+        let mut visited_count = 0;
         loop {
+            let current = Arc::as_ptr(&object.0);
+            if visited[..visited_count].contains(&current) {
+                return Err(AmlError::ReferenceCycle);
+            }
+            if visited_count == visited.len() {
+                return Err(AmlError::BudgetExceeded);
+            }
+            visited[visited_count] = current;
+            visited_count += 1;
+
             if let Object::Reference { kind, ref inner } = *object
-                && (kind == ReferenceKind::Local || kind == ReferenceKind::Arg || kind == ReferenceKind::Named)
+                && should_unwrap(kind)
             {
                 object = inner.clone();
             } else {
-                return object.clone();
+                return Ok(object.clone());
             }
         }
     }
@@ -190,8 +380,20 @@ impl WrappedObject {
         let mut arg_to_local: Option<WrappedObject> = None;
 
         let mut target = self;
+        let mut visited = [core::ptr::null(); MAX_REFERENCE_STORE_DEPTH];
+        let mut visited_count = 0;
 
         loop {
+            let current = Arc::as_ptr(&target.0);
+            if visited[..visited_count].contains(&current) {
+                return Err(AmlError::ReferenceCycle);
+            }
+            if visited_count == visited.len() {
+                return Err(AmlError::BudgetExceeded);
+            }
+            visited[visited_count] = current;
+            visited_count += 1;
+
             let Object::Reference { kind, ref inner } = *target else {
                 return Ok(match arg_to_local {
                     Some(_) if !store_to_arg && target.typ() == ObjectType::String => (target.clone(), true),
@@ -201,6 +403,7 @@ impl WrappedObject {
             };
 
             match kind {
+                ReferenceKind::ImmutableNamed => return Err(AmlError::StoreToInvalidReferenceType),
                 ReferenceKind::Named | ReferenceKind::RefOf | ReferenceKind::Index => {
                     crossed_true_reference = true
                 }
@@ -230,19 +433,27 @@ impl ops::Deref for WrappedObject {
          * responsibility to ensure shared references from `Deref` do not co-exist with an
          * exclusive reference.
          */
-        unsafe { &*self.0.get() }
+        unsafe { &*self.0.object.get() }
     }
 }
 
 impl fmt::Display for WrappedObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Wrapped({})", unsafe { &*self.0.get() })
+        write!(f, "Wrapped({})", unsafe { &*self.0.object.get() })
     }
 }
 
 impl Object {
     pub fn wrap(self) -> WrappedObject {
         WrappedObject::new(self)
+    }
+
+    pub(crate) fn wrap_metered(
+        self,
+        cell_heap_reservation: Option<Box<dyn ObjectHeapReservation>>,
+        heap_reservation: Option<Box<dyn ObjectHeapReservation>>,
+    ) -> WrappedObject {
+        WrappedObject::new_metered(self, cell_heap_reservation, heap_reservation)
     }
 
     /// Unwraps an integer object. Errors if not already an integer.
@@ -256,9 +467,9 @@ impl Object {
         }
     }
 
-    pub fn as_string(&self) -> Result<Cow<'_, str>, AmlError> {
+    pub fn as_string(&self) -> Result<&str, AmlError> {
         if let Object::String(value) = self {
-            Ok(Cow::from(value))
+            Ok(value)
         } else {
             Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::String, got: self.typ() })
         }
@@ -296,11 +507,11 @@ impl Object {
                  * 'real' parser to handle those cases.
                  */
                 let value = value.trim();
-                let value = value.to_ascii_lowercase();
-                let (value, radix): (&str, u32) = match value.strip_prefix("0x") {
-                    Some(value) => (value.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or(""), 16),
-                    None => (value.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""), 10),
-                };
+                let (value, radix): (&str, u32) =
+                    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                        Some(value) => (value.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or(""), 16),
+                        None => (value.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""), 10),
+                    };
                 match value.len() {
                     0 => Ok(0),
                     _ => Ok(u64::from_str_radix(value, radix).map_err(|_| {
@@ -308,26 +519,62 @@ impl Object {
                     })?),
                 }
             }
-            Object::BufferField { .. } => self.read_buffer_field(integer_size)?.to_integer(integer_size),
+            Object::BufferField { buffer, offset, length } => {
+                let buffer = buffer.clone().unwrap_transparent_reference()?;
+                let bytes = match &*buffer {
+                    Object::Buffer(bytes) => bytes.as_slice(),
+                    Object::String(string) => string.as_bytes(),
+                    typ => {
+                        return Err(AmlError::InvalidOperationOnObject {
+                            op: Operation::ReadBufferField,
+                            typ: typ.typ(),
+                        });
+                    }
+                };
+
+                // Integer conversion truncates a BufferField to the AML integer
+                // width. Do not materialize the entire field as a temporary
+                // Buffer when only its first 32 or 64 bits are observable.
+                let source_bits = bytes.len().saturating_mul(8);
+                let readable_bits = source_bits.saturating_sub(*offset);
+                let integer_bits = (integer_size as usize).saturating_mul(8);
+                let bit_length = usize::min(*length, integer_bits).min(readable_bits);
+                let mut result = [0_u8; 8];
+                copy_bits(bytes, *offset, &mut result, 0, bit_length);
+                Ok(u64::from_le_bytes(result))
+            }
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ToInteger, typ: self.typ() })?,
         }
     }
 
-    pub fn to_buffer(&self, integer_size: IntegerSize) -> Result<Vec<u8>, AmlError> {
+    pub fn buffer_conversion_size(&self, integer_size: IntegerSize) -> Result<usize, AmlError> {
         match self {
-            Object::Buffer(bytes) => Ok(bytes.clone()),
-            Object::Integer(value) => match integer_size {
-                IntegerSize::FourBytes => Ok((*value as u32).to_le_bytes().to_vec()),
-                IntegerSize::EightBytes => Ok(value.to_le_bytes().to_vec()),
-            },
-            Object::String(value) => Ok(value.as_bytes().to_vec()),
+            Object::Buffer(bytes) => Ok(bytes.len()),
+            Object::Integer(_) => Ok(integer_size as usize),
+            Object::String(value) => Ok(value.len()),
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ConvertToBuffer, typ: self.typ() }),
         }
     }
 
+    pub fn to_buffer(&self, integer_size: IntegerSize) -> Result<Vec<u8>, AmlError> {
+        let size = self.buffer_conversion_size(integer_size)?;
+        let mut bytes = allocator::vec_new();
+        bytes.try_reserve_exact(size).map_err(|_| AmlError::BudgetExceeded)?;
+        match self {
+            Object::Buffer(source) => bytes.extend_from_slice(source),
+            Object::Integer(value) => match integer_size {
+                IntegerSize::FourBytes => bytes.extend_from_slice(&(*value as u32).to_le_bytes()),
+                IntegerSize::EightBytes => bytes.extend_from_slice(&value.to_le_bytes()),
+            },
+            Object::String(value) => bytes.extend_from_slice(value.as_bytes()),
+            _ => unreachable!("buffer_conversion_size validated the object type"),
+        }
+        Ok(bytes)
+    }
+
     pub fn read_buffer_field(&self, integer_size: IntegerSize) -> Result<Object, AmlError> {
         if let Self::BufferField { buffer, offset, length } = self {
-            let buffer = buffer.clone().unwrap_transparent_reference();
+            let buffer = buffer.clone().unwrap_transparent_reference()?;
             let buffer = match &*buffer {
                 Object::Buffer(buffer) => buffer.as_slice(),
                 Object::String(string) => string.as_bytes(),
@@ -343,7 +590,10 @@ impl Object {
                 copy_bits(buffer, *offset, &mut dst, 0, *length);
                 Ok(Object::Integer(u64::from_le_bytes(dst)))
             } else {
-                let mut dst = alloc::vec![0u8; length.div_ceil(8)];
+                let byte_length = length.div_ceil(8);
+                let mut dst = allocator::vec_new();
+                dst.try_reserve_exact(byte_length).map_err(|_| AmlError::BudgetExceeded)?;
+                dst.resize(byte_length, 0);
                 copy_bits(buffer, *offset, &mut dst, 0, *length);
                 Ok(Object::Buffer(dst))
             }
@@ -353,22 +603,38 @@ impl Object {
     }
 
     pub fn write_buffer_field(&mut self, value: &[u8], token: &ObjectToken) -> Result<(), AmlError> {
-        // TODO: bounds check the buffer first to avoid panicking
         if let Self::BufferField { buffer, offset, length } = self {
-            let buffer = buffer.clone().unwrap_transparent_reference();
-            let buffer = match unsafe { buffer.gain_mut(token) } {
-                Object::Buffer(buffer) => buffer.as_mut_slice(),
-                // XXX: this unfortunately requires us to trust AML to keep the string as valid
-                // UTF8... maybe there is a better way?
-                Object::String(string) => unsafe { string.as_bytes_mut() },
+            let buffer = buffer.clone().unwrap_transparent_reference()?;
+            match unsafe { buffer.gain_mut(token) } {
+                Object::Buffer(buffer) => {
+                    let destination_bits = buffer.len().checked_mul(8).ok_or(AmlError::BudgetExceeded)?;
+                    let field_end = offset.checked_add(*length).ok_or(AmlError::IndexOutOfBounds)?;
+                    if field_end > destination_bits {
+                        return Err(AmlError::IndexOutOfBounds);
+                    }
+                    copy_bits(value, 0, buffer, *offset, *length);
+                }
+                Object::String(string) => {
+                    let destination_bits = string.len().checked_mul(8).ok_or(AmlError::BudgetExceeded)?;
+                    let field_end = offset.checked_add(*length).ok_or(AmlError::IndexOutOfBounds)?;
+                    if field_end > destination_bits {
+                        return Err(AmlError::IndexOutOfBounds);
+                    }
+                    let mut bytes = allocator::vec_from_slice(string.as_bytes());
+                    copy_bits(value, 0, &mut bytes, *offset, *length);
+                    allocator::replace_string_bytes(string, bytes)
+                        .map_err(|_| AmlError::InvalidOperationOnObject {
+                            op: Operation::WriteBufferField,
+                            typ: ObjectType::String,
+                        })?;
+                }
                 typ => {
                     return Err(AmlError::InvalidOperationOnObject {
                         op: Operation::WriteBufferField,
                         typ: typ.typ(),
                     });
                 }
-            };
-            copy_bits(value, 0, buffer, *offset, *length);
+            }
             Ok(())
         } else {
             Err(AmlError::InvalidOperationOnObject { op: Operation::WriteBufferField, typ: self.typ() })
@@ -394,10 +660,10 @@ impl Object {
                 *value = u64::from_le_bytes(bytes);
             }
             Object::String(value) => {
-                *value = String::from_utf8_lossy(new_bytes).split('\0').next().unwrap().to_string();
+                *value = super::try_lossy_string_prefix(new_bytes)?;
             }
             Object::Buffer(value) => {
-                *value = new_bytes.to_vec();
+                *value = allocator::vec_from_slice(new_bytes);
             }
             _ => return Err(AmlError::InvalidImplicitCast { from: self.typ(), to: new.typ() }),
         }
@@ -520,12 +786,12 @@ impl FieldFlags {
         self.0.get_bit(4)
     }
 
-    pub fn update_rule(&self) -> FieldUpdateRule {
+    pub fn update_rule(&self) -> Result<FieldUpdateRule, AmlError> {
         match self.0.get_bits(5..7) {
-            0 => FieldUpdateRule::Preserve,
-            1 => FieldUpdateRule::WriteAsOnes,
-            2 => FieldUpdateRule::WriteAsZeros,
-            _ => unreachable!(),
+            0 => Ok(FieldUpdateRule::Preserve),
+            1 => Ok(FieldUpdateRule::WriteAsOnes),
+            2 => Ok(FieldUpdateRule::WriteAsZeros),
+            _ => Err(AmlError::InvalidFieldFlags),
         }
     }
 }
@@ -550,6 +816,7 @@ impl MethodFlags {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ReferenceKind {
     Named,
+    ImmutableNamed,
     RefOf,
     Local,
     Arg,
@@ -682,14 +949,40 @@ mod tests {
     }
 
     #[test]
+    fn reference_value_cannot_be_stored_into_its_own_target() {
+        let target = Object::Integer(1).wrap();
+        let source = Object::Reference { kind: ReferenceKind::RefOf, inner: target.clone() }.wrap();
+        assert!(source.would_create_reference_cycle(&target, None).unwrap());
+
+        let independent_value = Object::Integer(2).wrap();
+        assert!(!independent_value.would_create_reference_cycle(&target, None).unwrap());
+    }
+
+    #[test]
     fn buffer_to_integer() {
-        let buffer = Object::Buffer(Vec::from([0xab, 0xcd, 0xef, 0x01, 0xff]));
+        let buffer = Object::Buffer(allocator::vec_from_array([0xab, 0xcd, 0xef, 0x01, 0xff]));
         assert_eq!(buffer.to_integer(IntegerSize::FourBytes).unwrap(), 0x01efcdab);
+    }
+
+    #[test]
+    fn buffer_conversion_preserves_bytes_and_reports_exact_size() {
+        let string = Object::String("ACPI".to_string());
+        assert_eq!(string.buffer_conversion_size(IntegerSize::EightBytes).unwrap(), 4);
+        assert_eq!(string.to_buffer(IntegerSize::EightBytes).unwrap(), b"ACPI");
+
+        let integer = Object::Integer(0x1234);
+        assert_eq!(integer.buffer_conversion_size(IntegerSize::FourBytes).unwrap(), 4);
+        assert_eq!(integer.to_buffer(IntegerSize::FourBytes).unwrap(), [0x34, 0x12, 0, 0]);
+        assert_eq!(integer.to_buffer(IntegerSize::EightBytes).unwrap(), [0x34, 0x12, 0, 0, 0, 0, 0, 0]);
+
+        let buffer = Object::Buffer(crate::aml_vec![0x5a, 0xa5]);
+        assert_eq!(buffer.buffer_conversion_size(IntegerSize::FourBytes).unwrap(), 2);
+        assert_eq!(buffer.to_buffer(IntegerSize::FourBytes).unwrap(), [0x5a, 0xa5]);
     }
     #[test]
     fn buffer_field_to_integer() {
         const BUFFER: [u8; 5] = [0xffu8; 5];
-        let buffer = Object::Buffer(Vec::from(BUFFER)).wrap();
+        let buffer = Object::Buffer(allocator::vec_from_slice(BUFFER)).wrap();
         let buffer_field = Object::BufferField { buffer, offset: 5, length: 9 };
 
         assert_eq!(buffer_field.to_integer(IntegerSize::FourBytes).unwrap(), 0x1ff);
@@ -699,7 +992,7 @@ mod tests {
     fn buffer_field_to_4_byte_integer() {
         // The ones in this buffer are strategically chosen to not make it to the final integer.
         const BUFFER: [u8; 5] = [0x0f, 0x00, 0x00, 0x00, 0xf0];
-        let buffer = Object::Buffer(Vec::from(BUFFER)).wrap();
+        let buffer = Object::Buffer(allocator::vec_from_slice(BUFFER)).wrap();
         let buffer_field = Object::BufferField {
             buffer,
             offset: 4,
@@ -712,10 +1005,18 @@ mod tests {
     #[test]
     fn buffer_field_to_8_byte_integer() {
         const BUFFER: [u8; 6] = [0x0f, 0x00, 0x00, 0x00, 0xf0, 0xff];
-        let buffer = Object::Buffer(Vec::from(BUFFER)).wrap();
+        let buffer = Object::Buffer(allocator::vec_from_slice(BUFFER)).wrap();
         let buffer_field = Object::BufferField { buffer, offset: 4, length: 36 };
 
         assert_eq!(buffer_field.to_integer(IntegerSize::EightBytes).unwrap(), 0x0000000f_00000000);
+    }
+
+    #[test]
+    fn oversized_buffer_field_copy_reports_allocation_failure() {
+        let buffer = Object::Buffer(allocator::vec_new()).wrap();
+        let buffer_field = Object::BufferField { buffer, offset: 0, length: usize::MAX };
+
+        assert!(matches!(buffer_field.read_buffer_field(IntegerSize::EightBytes), Err(AmlError::BudgetExceeded)));
     }
 
     #[test]
@@ -735,6 +1036,13 @@ mod tests {
             panic!("Incorrect type");
         };
         assert_eq!(*x, 1);
+    }
+
+    #[test]
+    fn immutable_named_reference_cannot_be_a_store_target() {
+        let target =
+            Object::Reference { kind: ReferenceKind::ImmutableNamed, inner: Object::Integer(1).wrap() }.wrap();
+        assert!(matches!(target.unwrap_ref_for_store(), Err(AmlError::StoreToInvalidReferenceType)));
     }
 
     #[test]

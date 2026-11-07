@@ -5,6 +5,7 @@ mod test_infra;
 
 use crate::test_infra::{evaluate, run_aml_test};
 use acpi::aml::{
+    InterruptModelUsed,
     namespace::AmlName,
     object::Object,
     pci_routing::{PciRoutingTable, Pin},
@@ -150,6 +151,8 @@ DefinitionBlock("", "DSDT", 2, "RSACPI", "PRTTST", 1) {
 "#;
 
     let interpreter = run_aml_test(AML, NullHandler {});
+    assert!(!interpreter.set_interrupt_model_used(InterruptModelUsed::ApicMode).unwrap());
+    assert!(interpreter.set_interrupt_model_used(InterruptModelUsed::ApicMode).is_err());
     let table =
         PciRoutingTable::from_prt_path(AmlName::from_str("\\_SB.PCI0._PRT").unwrap(), &interpreter).unwrap();
 
@@ -158,6 +161,23 @@ DefinitionBlock("", "DSDT", 2, "RSACPI", "PRTTST", 1) {
     assert_eq!(table.route(1, 0, Pin::IntA, &interpreter).unwrap().irqs, Irqs::from_buf([11]));
     assert_eq!(table.route(2, 0, Pin::IntB, &interpreter).unwrap().irqs, Irqs::from_buf([10]));
     assert_eq!(table.route(3, 0, Pin::IntC, &interpreter).unwrap().irqs, Irqs::from_buf([19]));
+}
+
+#[test]
+fn high_level_pic_helper_executes_firmware_method_once() {
+    const AML: &str = r#"
+DefinitionBlock("", "DSDT", 2, "RSACPI", "PICTST", 1) {
+    Name (PICV, 0)
+    Method (_PIC, 1, NotSerialized) {
+        Store (Arg0, PICV)
+    }
+}
+"#;
+
+    let interpreter = run_aml_test(AML, NullHandler {});
+    assert!(interpreter.set_interrupt_model_used(InterruptModelUsed::ApicMode).unwrap());
+    assert!(matches!(evaluate(&interpreter, "\\PICV"), Object::Integer(1)));
+    assert!(interpreter.set_interrupt_model_used(InterruptModelUsed::ApicMode).is_err());
 }
 
 /// `DerefOf` of a string is a namespace lookup, and must not recurse into the object it finds -

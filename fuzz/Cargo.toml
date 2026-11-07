@@ -1,0 +1,38 @@
+[package]
+name = "acpi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+autobins = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+acpi = { path = "..", default-features = false, features = ["alloc", "aml"] }
+aml-test-tools = { path = "../tools/aml-test-tools" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "aml_load"
+path = "fuzz_targets/aml_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aml_execute"
+path = "fuzz_targets/aml_execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resource_template"
+path = "fuzz_targets/resource_template.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

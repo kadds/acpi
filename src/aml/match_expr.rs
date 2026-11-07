@@ -10,13 +10,20 @@ pub fn do_match(
     operand_b: u64,
     start_index: u64,
 ) -> u64 {
-    for (idx, row) in search_package[start_index as usize..].iter().enumerate() {
+    let Ok(start_index_usize) = usize::try_from(start_index) else {
+        return ONES;
+    };
+    if start_index_usize >= search_package.len() {
+        return ONES;
+    }
+
+    for (idx, row) in search_package[start_index_usize..].iter().enumerate() {
         let Ok(v) = row.as_integer() else {
             continue;
         };
 
         if match_comparison(v, op_a, operand_a) && match_comparison(v, op_b, operand_b) {
-            return start_index + idx as u64;
+            return u64::try_from(idx).ok().and_then(|offset| start_index.checked_add(offset)).unwrap_or(ONES);
         }
     }
 
@@ -98,6 +105,13 @@ mod tests {
     fn impossible_match_returns_ones() {
         let pkg = &([0, 1, 2, 3].iter().map(|i| Object::Integer(*i as u64).wrap()).collect());
         assert_eq!(ONES, do_match(pkg, &MatchOp::MEQ, 2, &MatchOp::MLT, 1, 0));
+    }
+
+    #[test]
+    fn out_of_range_start_index_returns_ones() {
+        let package = vec![Object::Integer(7).wrap()];
+        assert_eq!(ONES, do_match(&package, &MatchOp::MTR, 0, &MatchOp::MTR, 0, 1));
+        assert_eq!(ONES, do_match(&package, &MatchOp::MTR, 0, &MatchOp::MTR, 0, u64::MAX));
     }
 
     #[test]

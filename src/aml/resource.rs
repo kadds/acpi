@@ -1,6 +1,6 @@
-use super::object::WrappedObject;
-use crate::aml::{AmlError, Operation, object::Object};
-use alloc::vec::Vec;
+use super::{object::WrappedObject, try_string_from_str, try_vec_from_slice};
+use crate::aml::{AmlError, ExecutionMeter, Operation, object::Object};
+use super::allocator::{self, String, Vec};
 use bit_field::BitField;
 use byteorder::{ByteOrder, LittleEndian};
 use core::mem;
@@ -23,7 +23,6 @@ const UNSUPPORTED_LARGE_RESOURCE_DESCRIPTORS: &[(u8, &str)] = &[
     (0x03, "0x03 Reserved"),
     (0x04, "Vendor-defined Descriptor"),
     (0x05, "32-bit Memory Range Descriptor"),
-    (0x0b, "Extended Address Space Descriptor"),
     (0x0d, "Pin Function Descriptor"),
     (0x0f, "Pin Configuration Descriptor"),
     (0x10, "Pin Group Descriptor"),
@@ -39,25 +38,105 @@ const UNSUPPORTED_SMALL_RESOURCE_DESCRIPTORS: &[(u8, &str)] = &[
     (0x0e, "Vendor Defined Descriptor"),
 ];
 
+const MAX_RESOURCE_DESCRIPTORS: usize = 256;
+const INITIAL_RESOURCE_CAPACITY: usize = 4;
+const RESOURCE_DEADLINE_SAMPLE_INTERVAL: usize = 256;
+
+struct ResourceScanBudget<'a> {
+    meter: Option<&'a dyn ExecutionMeter>,
+    iterations: usize,
+}
+
+impl ResourceScanBudget<'_> {
+    fn charge_iteration(&mut self) -> Result<(), AmlError> {
+        if let Some(meter) = self.meter {
+            meter.loop_iteration()?;
+        }
+        self.iterations = self.iterations.checked_add(1).ok_or(AmlError::BudgetExceeded)?;
+        if self.iterations % RESOURCE_DEADLINE_SAMPLE_INTERVAL == 0 {
+            if let Some(meter) = self.meter {
+                meter.check_deadline()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), AmlError> {
+        for _ in 0..bytes {
+            self.charge_iteration()?;
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<(), AmlError> {
+        if let Some(meter) = self.meter {
+            meter.check_deadline()?;
+        }
+        Ok(())
+    }
+}
+
 /// Parse a `ResourceDescriptor` buffer into a list of resources.
 pub fn resource_descriptor_list(descriptor: WrappedObject) -> Result<Vec<Resource>, AmlError> {
+    resource_descriptor_list_with_meter(descriptor, None)
+}
+
+/// Parse a resource template while charging descriptor scans to an AML
+/// execution work unit. Unsupported descriptors consume fuel too.
+#[doc(hidden)]
+pub fn resource_descriptor_list_metered(
+    descriptor: WrappedObject,
+    meter: &dyn ExecutionMeter,
+) -> Result<Vec<Resource>, AmlError> {
+    resource_descriptor_list_with_meter(descriptor, Some(meter))
+}
+
+fn resource_descriptor_list_with_meter(
+    descriptor: WrappedObject,
+    meter: Option<&dyn ExecutionMeter>,
+) -> Result<Vec<Resource>, AmlError> {
     if let Object::Buffer(ref bytes) = *descriptor {
-        let mut descriptors = Vec::new();
+        let mut descriptors = allocator::vec_new();
         let mut bytes = bytes.as_slice();
+        let mut scan_budget = ResourceScanBudget { meter, iterations: 0 };
+        let mut unsupported_warning_emitted = false;
 
         while !bytes.is_empty() {
-            let (descriptor, remaining_bytes) = resource_descriptor(bytes)?;
+            scan_budget.charge_iteration()?;
+
+            let (descriptor, remaining_bytes) =
+                resource_descriptor(bytes, &mut unsupported_warning_emitted, &mut scan_budget)?;
 
             if let Some(descriptor) = descriptor {
+                if descriptors.len() == MAX_RESOURCE_DESCRIPTORS {
+                    return Err(AmlError::HostError(alloc::string::String::from(
+                        "ACPI_RESOURCE_COUNT_LIMIT",
+                    )));
+                }
+                reserve_resource_slot(&mut descriptors)?;
                 descriptors.push(descriptor);
             }
             bytes = remaining_bytes;
         }
 
+        scan_budget.check_deadline()?;
         Ok(descriptors)
     } else {
         Err(AmlError::InvalidOperationOnObject { op: Operation::ParseResource, typ: descriptor.typ() })
     }
+}
+
+fn reserve_resource_slot(resources: &mut Vec<Resource>) -> Result<(), AmlError> {
+    if resources.len() < resources.capacity() {
+        return Ok(());
+    }
+    let doubled = resources.capacity().checked_mul(2).unwrap_or(MAX_RESOURCE_DESCRIPTORS);
+    let target_capacity = usize::min(MAX_RESOURCE_DESCRIPTORS, usize::max(INITIAL_RESOURCE_CAPACITY, doubled));
+    let additional = target_capacity
+        .checked_sub(resources.len())
+        .filter(|additional| *additional != 0)
+        .ok_or(AmlError::BudgetExceeded)?;
+    resources.try_reserve_exact(additional).map_err(|_| AmlError::BudgetExceeded)
 }
 
 fn unsupported_resource_descriptor_name(
@@ -72,15 +151,26 @@ fn skip_unsupported_resource<'a>(
     descriptor_type: u8,
     descriptor_name: &str,
     remaining_bytes: &'a [u8],
+    warning_emitted: &mut bool,
 ) -> Result<(Option<Resource>, &'a [u8]), AmlError> {
-    log::warn!("skipping unsupported {size} resource descriptor type {descriptor_type:#x}: {descriptor_name}");
+    if !*warning_emitted {
+        log::warn!("skipping unsupported {size} resource descriptor type {descriptor_type:#x}: {descriptor_name}");
+        *warning_emitted = true;
+    }
     Ok((None, remaining_bytes))
 }
 
-fn resource_descriptor(bytes: &[u8]) -> Result<(Option<Resource>, &[u8]), AmlError> {
+fn resource_descriptor<'a>(
+    bytes: &'a [u8],
+    unsupported_warning_emitted: &mut bool,
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<(Option<Resource>, &'a [u8]), AmlError> {
     /*
      * If bit 7 of Byte 0 is set, it's a large descriptor. If not, it's a small descriptor.
      */
+    if bytes.is_empty() {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
     if bytes[0].get_bit(7) {
         /*
          * We're parsing a large item. The descriptor type is encoded in Bits 0-6 of Byte 0. Valid types:
@@ -108,26 +198,42 @@ fn resource_descriptor(bytes: &[u8]) -> Result<(Option<Resource>, &[u8]), AmlErr
          * Byte 1 contains bits 0-7 of the length, and Byte 2 contains bits 8-15 of the length. Subsequent
          * bytes contain the actual data items.
          */
+        if bytes.len() < 3 {
+            return Err(AmlError::InvalidResourceDescriptor);
+        }
         let descriptor_type = bytes[0].get_bits(0..7);
         let length = LittleEndian::read_u16(&bytes[1..=2]) as usize;
-        let (descriptor_bytes, remaining_bytes) = bytes.split_at(length + 3);
+        let descriptor_length = length.checked_add(3).ok_or(AmlError::InvalidResourceDescriptor)?;
+        if descriptor_length > bytes.len() {
+            return Err(AmlError::InvalidResourceDescriptor);
+        }
+        let (descriptor_bytes, remaining_bytes) = bytes.split_at(descriptor_length);
 
         let descriptor = match descriptor_type {
             0x06 => fixed_memory_descriptor(descriptor_bytes),
-            0x07 => address_space_descriptor::<u32>(descriptor_bytes),
-            0x08 => address_space_descriptor::<u16>(descriptor_bytes),
-            0x09 => extended_interrupt_descriptor(descriptor_bytes),
-            0x0a => address_space_descriptor::<u64>(descriptor_bytes),
-            0x0c => gpio_connection_descriptor(descriptor_bytes),
-            0x0e => serial_bus_descriptor(descriptor_bytes),
+            0x07 => address_space_descriptor::<u32>(descriptor_bytes, scan_budget),
+            0x08 => address_space_descriptor::<u16>(descriptor_bytes, scan_budget),
+            0x09 => extended_interrupt_descriptor(descriptor_bytes, scan_budget),
+            0x0a => address_space_descriptor::<u64>(descriptor_bytes, scan_budget),
+            0x0b => extended_address_space_descriptor(descriptor_bytes, scan_budget),
+            0x0c => gpio_connection_descriptor(descriptor_bytes, scan_budget),
+            0x0e => serial_bus_descriptor(descriptor_bytes, scan_budget),
 
             0x00 | 0x13..=0x7f => Err(AmlError::InvalidResourceDescriptor),
             0x80..=0xff => unreachable!(),
             _ => {
-                let descriptor_name =
+                let Some(descriptor_name) =
                     unsupported_resource_descriptor_name(UNSUPPORTED_LARGE_RESOURCE_DESCRIPTORS, descriptor_type)
-                        .unwrap();
-                return skip_unsupported_resource("large", descriptor_type, descriptor_name, remaining_bytes);
+                else {
+                    return Err(AmlError::InvalidResourceDescriptor);
+                };
+                return skip_unsupported_resource(
+                    "large",
+                    descriptor_type,
+                    descriptor_name,
+                    remaining_bytes,
+                    unsupported_warning_emitted,
+                );
             }
         }?;
 
@@ -156,21 +262,33 @@ fn resource_descriptor(bytes: &[u8]) -> Result<(Option<Resource>, &[u8]), AmlErr
          */
         let descriptor_type = bytes[0].get_bits(3..=6);
         let length: usize = bytes[0].get_bits(0..=2) as usize;
-        let (descriptor_bytes, remaining_bytes) = bytes.split_at(length + 1);
+        let descriptor_length = length + 1;
+        if descriptor_length > bytes.len() {
+            return Err(AmlError::InvalidResourceDescriptor);
+        }
+        let (descriptor_bytes, remaining_bytes) = bytes.split_at(descriptor_length);
 
         let descriptor = match descriptor_type {
             0x00..=0x03 => Err(AmlError::InvalidResourceDescriptor),
-            0x04 => irq_format_descriptor(descriptor_bytes),
+            0x04 => irq_format_descriptor(descriptor_bytes, scan_budget),
             0x05 => dma_format_descriptor(descriptor_bytes),
             0x08 => io_port_descriptor(descriptor_bytes),
             0x0B..=0x0D => Err(AmlError::InvalidResourceDescriptor),
             0x0F => return Ok((None, &[])),
             0x10..=0xFF => unreachable!(),
             _ => {
-                let descriptor_name =
+                let Some(descriptor_name) =
                     unsupported_resource_descriptor_name(UNSUPPORTED_SMALL_RESOURCE_DESCRIPTORS, descriptor_type)
-                        .unwrap();
-                return skip_unsupported_resource("small", descriptor_type, descriptor_name, remaining_bytes);
+                else {
+                    return Err(AmlError::InvalidResourceDescriptor);
+                };
+                return skip_unsupported_resource(
+                    "small",
+                    descriptor_type,
+                    descriptor_name,
+                    remaining_bytes,
+                    unsupported_warning_emitted,
+                );
             }
         }?;
 
@@ -195,6 +313,7 @@ pub enum AddressSpaceResourceType {
     MemoryRange,
     IORange,
     BusNumberRange,
+    VendorDefined(u8),
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -209,11 +328,22 @@ pub struct AddressSpaceDescriptor {
     pub is_maximum_address_fixed: bool,
     pub is_minimum_address_fixed: bool,
     pub decode_type: AddressSpaceDecodeType,
+    /// Raw General Flags and Type Specific Flags from the AML descriptor.
+    /// Keeping these fields prevents policy layers from losing producer/
+    /// consumer, memory, cacheability, and bridge-translation information.
+    pub general_flags: u8,
+    pub type_specific_flags: u8,
 
     pub granularity: u64,
     pub address_range: (u64, u64),
     pub translation_offset: u64,
     pub length: u64,
+    /// Present only for an Extended Address Space descriptor.
+    pub revision_id: Option<u8>,
+    /// Present only for an Extended Address Space descriptor.
+    pub type_specific_attributes: Option<u64>,
+    pub resource_source_index: Option<u8>,
+    pub resource_source: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -255,7 +385,46 @@ fn fixed_memory_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     Ok(Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation { is_writable, base_address, range_length }))
 }
 
-fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
+fn address_space_resource_type(value: u8) -> Result<AddressSpaceResourceType, AmlError> {
+    match value {
+        0 => Ok(AddressSpaceResourceType::MemoryRange),
+        1 => Ok(AddressSpaceResourceType::IORange),
+        2 => Ok(AddressSpaceResourceType::BusNumberRange),
+        3..=191 => Err(AmlError::InvalidResourceDescriptor),
+        192..=255 => Ok(AddressSpaceResourceType::VendorDefined(value)),
+    }
+}
+
+fn parse_resource_source(
+    bytes: &[u8],
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<(Option<u8>, Option<String>), AmlError> {
+    if bytes.is_empty() {
+        return Ok((None, None));
+    }
+    let (&index, source_bytes) = bytes.split_first().ok_or(AmlError::InvalidResourceDescriptor)?;
+    let mut terminator = None;
+    for (offset, byte) in source_bytes.iter().enumerate() {
+        scan_budget.charge_iteration()?;
+        if *byte == 0 {
+            terminator = Some(offset);
+            break;
+        }
+    }
+    let terminator = terminator.ok_or(AmlError::InvalidResourceDescriptor)?;
+    if terminator == 0 || terminator > 255 || terminator + 1 != source_bytes.len() {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let source_result = core::str::from_utf8(&source_bytes[..terminator]);
+    scan_budget.check_deadline()?;
+    let source = source_result.map_err(|_| AmlError::InvalidResourceDescriptor)?;
+    Ok((Some(index), Some(try_string_from_str(source)?)))
+}
+
+fn address_space_descriptor<T>(
+    bytes: &[u8],
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<Resource, AmlError> {
     /*
      * WORD Address Space Descriptor Definition
      * Note: The definitions for DWORD and QWORD are the same other than the width of the address fields.
@@ -300,17 +469,12 @@ fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
      */
     let size = mem::size_of::<T>();
 
-    if bytes.len() < 6 + size * 5 {
+    let fields_end = 6 + size * 5;
+    if bytes.len() < fields_end || bytes[4] & 0xf0 != 0 {
         return Err(AmlError::InvalidResourceDescriptor);
     }
 
-    let resource_type = match bytes[3] {
-        0 => AddressSpaceResourceType::MemoryRange,
-        1 => AddressSpaceResourceType::IORange,
-        2 => AddressSpaceResourceType::BusNumberRange,
-        3..=191 => return Err(AmlError::InvalidResourceDescriptor),
-        192..=255 => unimplemented!(),
-    };
+    let resource_type = address_space_resource_type(bytes[3])?;
 
     let general_flags = bytes[4];
     let is_maximum_address_fixed = general_flags.get_bit(3);
@@ -329,20 +493,110 @@ fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
     let address_range_max = LittleEndian::read_uint(address_fields.next().unwrap(), size);
     let translation_offset = LittleEndian::read_uint(address_fields.next().unwrap(), size);
     let length = LittleEndian::read_uint(address_fields.next().unwrap(), size);
+    let (resource_source_index, resource_source) = parse_resource_source(&bytes[fields_end..], scan_budget)?;
 
     Ok(Resource::AddressSpace(AddressSpaceDescriptor {
         resource_type,
         is_maximum_address_fixed,
         is_minimum_address_fixed,
         decode_type,
+        general_flags,
+        type_specific_flags: bytes[5],
         granularity,
         address_range: (address_range_min, address_range_max),
         translation_offset,
         length,
+        revision_id: None,
+        type_specific_attributes: None,
+        resource_source_index,
+        resource_source,
     }))
 }
 
-pub type Irqs = smallvec::SmallVec<[u32; 1]>;
+fn extended_address_space_descriptor(
+    bytes: &[u8],
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<Resource, AmlError> {
+    const EXTENDED_FIELDS_END: usize = 56;
+    if bytes.len() < EXTENDED_FIELDS_END || bytes[4] & 0xf0 != 0 || bytes[6] != 1 || bytes[7] != 0 {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+
+    let resource_type = address_space_resource_type(bytes[3])?;
+    let general_flags = bytes[4];
+    let mut address_fields = bytes[8..48].chunks_exact(8);
+    let granularity = LittleEndian::read_u64(address_fields.next().ok_or(AmlError::InvalidResourceDescriptor)?);
+    let address_range_min =
+        LittleEndian::read_u64(address_fields.next().ok_or(AmlError::InvalidResourceDescriptor)?);
+    let address_range_max =
+        LittleEndian::read_u64(address_fields.next().ok_or(AmlError::InvalidResourceDescriptor)?);
+    let translation_offset =
+        LittleEndian::read_u64(address_fields.next().ok_or(AmlError::InvalidResourceDescriptor)?);
+    let length = LittleEndian::read_u64(address_fields.next().ok_or(AmlError::InvalidResourceDescriptor)?);
+    let type_specific_attributes = Some(LittleEndian::read_u64(&bytes[48..56]));
+    let (resource_source_index, resource_source) =
+        parse_resource_source(&bytes[EXTENDED_FIELDS_END..], scan_budget)?;
+
+    Ok(Resource::AddressSpace(AddressSpaceDescriptor {
+        resource_type,
+        is_maximum_address_fixed: general_flags.get_bit(3),
+        is_minimum_address_fixed: general_flags.get_bit(2),
+        decode_type: if general_flags.get_bit(1) {
+            AddressSpaceDecodeType::Subtractive
+        } else {
+            AddressSpaceDecodeType::Additive
+        },
+        general_flags,
+        type_specific_flags: bytes[5],
+        granularity,
+        address_range: (address_range_min, address_range_max),
+        translation_offset,
+        length,
+        revision_id: Some(bytes[6]),
+        type_specific_attributes,
+        resource_source_index,
+        resource_source,
+    }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Irqs(Vec<u32>);
+
+impl Irqs {
+    pub fn new() -> Self {
+        Self(allocator::vec_new())
+    }
+
+    pub fn from_buf<const N: usize>(values: [u32; N]) -> Self {
+        Self(allocator::vec_from_array(values))
+    }
+
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), alloc::collections::TryReserveError> {
+        self.0.try_reserve(additional)
+    }
+
+    pub fn push(&mut self, value: u32) {
+        self.0.push(value);
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+impl Default for Irqs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::ops::Deref for Irqs {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct IrqDescriptor {
@@ -354,7 +608,7 @@ pub struct IrqDescriptor {
     pub irqs: Irqs,
 }
 
-fn irq_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+fn irq_format_descriptor(bytes: &[u8], scan_budget: &mut ResourceScanBudget<'_>) -> Result<Resource, AmlError> {
     /*
      * IRQ Descriptor Definition
      *
@@ -387,14 +641,16 @@ fn irq_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
      *              0  Level-Triggered – Interrupt is triggered in response to signal in a low state.
      *              1  Edge-Triggered – Interrupt is triggered in response to a change in signal state from low to high.
      */
-    fn irqs_from_bit_mask(bit_mask: u16) -> Irqs {
-        let mut irqs = Irqs::default();
+    fn irqs_from_bit_mask(bit_mask: u16, scan_budget: &mut ResourceScanBudget<'_>) -> Result<Irqs, AmlError> {
+        let mut irqs = Irqs::new();
+        irqs.try_reserve(bit_mask.count_ones() as usize).map_err(|_| AmlError::BudgetExceeded)?;
         for bit in 0..16 {
+            scan_budget.charge_iteration()?;
             if bit_mask.get_bit(bit) {
                 irqs.push(bit as u32);
             }
         }
-        irqs
+        Ok(irqs)
     }
 
     match bytes.len() {
@@ -404,7 +660,7 @@ fn irq_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
             let irq = LittleEndian::read_u16(&bytes[1..=2]);
 
             Ok(Resource::Irq(IrqDescriptor {
-                irqs: irqs_from_bit_mask(irq),
+                irqs: irqs_from_bit_mask(irq, scan_budget)?,
                 is_wake_capable: false,
                 is_shared: false,
                 polarity: InterruptPolarity::ActiveHigh,
@@ -430,7 +686,7 @@ fn irq_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
             };
 
             Ok(Resource::Irq(IrqDescriptor {
-                irqs: irqs_from_bit_mask(irq),
+                irqs: irqs_from_bit_mask(irq, scan_budget)?,
                 is_wake_capable,
                 is_shared,
                 polarity,
@@ -507,7 +763,7 @@ pub fn dma_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         0 => DMATransferTypePreference::_8BitOnly,
         1 => DMATransferTypePreference::_8And16Bit,
         2 => DMATransferTypePreference::_16Bit,
-        3 => unimplemented!("Reserved DMA transfer type preference"),
+        3 => return Err(AmlError::InvalidResourceDescriptor),
         _ => unreachable!(),
     };
 
@@ -556,7 +812,10 @@ fn io_port_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     Ok(Resource::IOPort(IOPortDescriptor { decodes_full_address, memory_range, base_alignment, range_length }))
 }
 
-fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+fn extended_interrupt_descriptor(
+    bytes: &[u8],
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<Resource, AmlError> {
     /*
      * --- Extended Interrupt Descriptor ---
      * Byte 3 contains the Interrupt Vector Flags:
@@ -578,15 +837,24 @@ fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     }
 
     let number_of_interrupts = bytes[4] as usize;
+    let interrupt_bytes = number_of_interrupts
+        .checked_mul(size_of::<u32>())
+        .and_then(|length| 5_usize.checked_add(length))
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    if interrupt_bytes > bytes.len() {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
 
     let irqs = if number_of_interrupts == 1 {
         let irq = LittleEndian::read_u32(&bytes[5..9]);
 
         Irqs::from_buf([irq])
     } else {
-        let mut irqs = Irqs::with_capacity(number_of_interrupts);
+        let mut irqs = Irqs::new();
+        irqs.try_reserve(number_of_interrupts).map_err(|_| AmlError::BudgetExceeded)?;
 
         for i in 0..number_of_interrupts {
+            scan_budget.charge_iteration()?;
             let start = 5 + i * size_of::<u32>();
             let end = start + 4;
 
@@ -637,7 +905,7 @@ pub struct SerialBusDescriptor {
     pub sharing: ShareType,
     pub usage: ResourceUsage,
     pub slave_mode: SlaveMode,
-    pub source: alloc::string::String,
+    pub source: String,
     pub source_index: u8,
     pub vendor_data: Vec<u8>,
     pub bus: SerialBus,
@@ -676,7 +944,7 @@ fn i2c_bus_descriptor(bytes: &[u8]) -> Result<(SerialBus, (usize, usize)), AmlEr
     ))
 }
 
-fn serial_bus_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+fn serial_bus_descriptor(bytes: &[u8], scan_budget: &mut ResourceScanBudget<'_>) -> Result<Resource, AmlError> {
     if bytes.len() < 12 {
         return Err(AmlError::InvalidResourceDescriptor);
     }
@@ -688,17 +956,27 @@ fn serial_bus_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         1 => i2c_bus_descriptor(bytes)?,
         _ => return Err(AmlError::LibUnimplemented),
     };
-    let vendor_data = &bytes[vendor_data_idx..vendor_data_idx + vendor_data_length];
-    let source = str::from_utf8(&bytes[vendor_data_idx + vendor_data_length..bytes.len() - 1])
-        .map_err(|_| AmlError::InvalidResourceDescriptor)?;
+    let vendor_data_end = vendor_data_idx
+        .checked_add(vendor_data_length)
+        .filter(|end| *end < bytes.len())
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    let vendor_data = try_vec_from_slice(&bytes[vendor_data_idx..vendor_data_end])?;
+    if bytes.last() != Some(&0) {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let source_bytes = &bytes[vendor_data_end..bytes.len() - 1];
+    scan_budget.charge_bytes(source_bytes.len())?;
+    let source_result = str::from_utf8(source_bytes);
+    scan_budget.check_deadline()?;
+    let source = source_result.map_err(|_| AmlError::InvalidResourceDescriptor)?;
 
     Ok(Resource::SerialBus(SerialBusDescriptor {
         sharing: if bytes[6].get_bit(2) { ShareType::Shared } else { ShareType::Exclusive },
         usage: if bytes[6].get_bit(1) { ResourceUsage::ResourceConsumer } else { ResourceUsage::ResourceProducer },
         slave_mode: if bytes[6].get_bit(0) { SlaveMode::DeviceInitiated } else { SlaveMode::ControllerInitiated },
         source_index: bytes[4],
-        source: alloc::string::String::from(source),
-        vendor_data: Vec::from(vendor_data),
+        source: try_string_from_str(source)?,
+        vendor_data,
         bus: descriptor,
     }))
 }
@@ -740,7 +1018,7 @@ pub struct GPIOConnectionDescriptor {
     pub output_drive_strength: u16,
     pub debounce_timeout: u16,
     pub pins: Vec<u16>,
-    pub source: alloc::string::String,
+    pub source: String,
     pub vendor_data: Vec<u8>,
     pub connection: GPIOConnection,
 }
@@ -751,7 +1029,10 @@ pub enum GPIOConnection {
     IO { io_restriction: IORestriction },
 }
 
-fn gpio_connection_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+fn gpio_connection_descriptor(
+    bytes: &[u8],
+    scan_budget: &mut ResourceScanBudget<'_>,
+) -> Result<Resource, AmlError> {
     if bytes.len() < 23 {
         return Err(AmlError::InvalidResourceDescriptor);
     }
@@ -764,10 +1045,45 @@ fn gpio_connection_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     let vendor_data_offset = LittleEndian::read_u16(&bytes[19..=20]) as usize;
     let vendor_data_length = LittleEndian::read_u16(&bytes[21..=22]) as usize;
 
-    let pin_count = (source_name_offset - pin_table_offset) / 2;
-    let vendor_data = &bytes[vendor_data_offset..vendor_data_offset + vendor_data_length];
-    let source = str::from_utf8(&bytes[source_name_offset..bytes.len() - vendor_data_length - 1])
-        .map_err(|_| AmlError::InvalidResourceDescriptor)?;
+    let pin_table_bytes = source_name_offset
+        .checked_sub(pin_table_offset)
+        .filter(|length| length % size_of::<u16>() == 0)
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    let pin_table_end = pin_table_offset
+        .checked_add(pin_table_bytes)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    if pin_table_offset < 23 || pin_table_end != source_name_offset {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let source_end = bytes
+        .len()
+        .checked_sub(vendor_data_length)
+        .and_then(|end| end.checked_sub(1))
+        .filter(|end| *end >= source_name_offset)
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    let vendor_data_end = vendor_data_offset
+        .checked_add(vendor_data_length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(AmlError::InvalidResourceDescriptor)?;
+    if bytes[source_end] != 0
+        || (vendor_data_length != 0 && (vendor_data_offset != source_end + 1 || vendor_data_end != bytes.len()))
+    {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let vendor_data = try_vec_from_slice(&bytes[vendor_data_offset..vendor_data_end])?;
+    let source_bytes = &bytes[source_name_offset..source_end];
+    scan_budget.charge_bytes(source_bytes.len())?;
+    let source_result = str::from_utf8(source_bytes);
+    scan_budget.check_deadline()?;
+    let source = source_result.map_err(|_| AmlError::InvalidResourceDescriptor)?;
+    let mut pins = allocator::vec_new();
+    let pin_count = pin_table_bytes / size_of::<u16>();
+    pins.try_reserve_exact(pin_count).map_err(|_| AmlError::BudgetExceeded)?;
+    for pin in bytes[pin_table_offset..pin_table_end].chunks_exact(size_of::<u16>()) {
+        scan_budget.charge_iteration()?;
+        pins.push(LittleEndian::read_u16(pin));
+    }
 
     Ok(Resource::GPIO(GPIOConnectionDescriptor {
         usage: if bytes[5].get_bit(0) { ResourceUsage::ResourceConsumer } else { ResourceUsage::ResourceProducer },
@@ -783,12 +1099,9 @@ fn gpio_connection_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         },
         output_drive_strength: LittleEndian::read_u16(&bytes[10..=11]),
         debounce_timeout: LittleEndian::read_u16(&bytes[12..=13]),
-        pins: bytes[pin_table_offset..pin_table_offset + 2 * (pin_count)]
-            .chunks(2)
-            .map(|b| LittleEndian::read_u16(&[b[0], b[1]]))
-            .collect::<Vec<u16>>(),
-        source: alloc::string::String::from(source),
-        vendor_data: Vec::from(vendor_data),
+        pins,
+        source: try_string_from_str(source)?,
+        vendor_data,
         connection: match bytes[4] {
             0 => GPIOConnection::Interrupt {
                 trigger: match bytes[7].get_bit(0) {
@@ -825,6 +1138,40 @@ fn gpio_connection_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aml::ExecutionMeter;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LoopBudgetMeter {
+        maximum_iterations: usize,
+        iterations: AtomicUsize,
+        deadline_checks: AtomicUsize,
+        reject_deadline: bool,
+    }
+
+    impl ExecutionMeter for LoopBudgetMeter {
+        fn charge_opcode(&self) -> Result<(), AmlError> {
+            Ok(())
+        }
+
+        fn enter_method(&self) -> Result<(), AmlError> {
+            Ok(())
+        }
+
+        fn leave_method(&self) {}
+
+        fn loop_iteration(&self) -> Result<(), AmlError> {
+            let iteration = self.iterations.fetch_add(1, Ordering::Relaxed);
+            if iteration >= self.maximum_iterations {
+                return Err(AmlError::BudgetExceeded);
+            }
+            Ok(())
+        }
+
+        fn check_deadline(&self) -> Result<(), AmlError> {
+            self.deadline_checks.fetch_add(1, Ordering::Relaxed);
+            if self.reject_deadline { Err(AmlError::DeadlineExceeded) } else { Ok(()) }
+        }
+    }
 
     #[test]
     fn test_parses_keyboard_crs() {
@@ -863,7 +1210,7 @@ mod tests {
 
         assert_eq!(
             resources,
-            Vec::from([
+            allocator::vec_from_array([
                 Resource::IOPort(IOPortDescriptor {
                     decodes_full_address: true,
                     memory_range: (0x60, 0x60),
@@ -882,7 +1229,7 @@ mod tests {
                     polarity: InterruptPolarity::ActiveHigh,
                     is_shared: false,
                     is_wake_capable: false,
-                    irqs: Irqs::from_buf([1])
+                irqs: Irqs::from_buf([1])
                 })
             ])
         );
@@ -973,16 +1320,22 @@ mod tests {
 
         assert_eq!(
             resources,
-            Vec::from([
+            allocator::vec_from_array([
                 Resource::AddressSpace(AddressSpaceDescriptor {
                     resource_type: AddressSpaceResourceType::BusNumberRange,
                     is_maximum_address_fixed: true,
                     is_minimum_address_fixed: true,
                     decode_type: AddressSpaceDecodeType::Additive,
+                    general_flags: 0x0c,
+                    type_specific_flags: 0,
                     granularity: 0,
                     address_range: (0x00, 0xFF),
                     translation_offset: 0,
-                    length: 0x100
+                    length: 0x100,
+                    revision_id: None,
+                    type_specific_attributes: None,
+                    resource_source_index: None,
+                    resource_source: None,
                 }),
                 Resource::IOPort(IOPortDescriptor {
                     decodes_full_address: true,
@@ -995,43 +1348,157 @@ mod tests {
                     is_maximum_address_fixed: true,
                     is_minimum_address_fixed: true,
                     decode_type: AddressSpaceDecodeType::Additive,
+                    general_flags: 0x0c,
+                    type_specific_flags: 0x03,
                     granularity: 0,
                     address_range: (0x0000, 0x0CF7),
                     translation_offset: 0,
-                    length: 0xCF8
+                    length: 0xCF8,
+                    revision_id: None,
+                    type_specific_attributes: None,
+                    resource_source_index: None,
+                    resource_source: None,
                 }),
                 Resource::AddressSpace(AddressSpaceDescriptor {
                     resource_type: AddressSpaceResourceType::IORange,
                     is_maximum_address_fixed: true,
                     is_minimum_address_fixed: true,
                     decode_type: AddressSpaceDecodeType::Additive,
+                    general_flags: 0x0c,
+                    type_specific_flags: 0x03,
                     granularity: 0,
                     address_range: (0x0D00, 0xFFFF),
                     translation_offset: 0,
-                    length: 0xF300
+                    length: 0xF300,
+                    revision_id: None,
+                    type_specific_attributes: None,
+                    resource_source_index: None,
+                    resource_source: None,
                 }),
                 Resource::AddressSpace(AddressSpaceDescriptor {
                     resource_type: AddressSpaceResourceType::MemoryRange,
                     is_maximum_address_fixed: true,
                     is_minimum_address_fixed: true,
                     decode_type: AddressSpaceDecodeType::Additive,
+                    general_flags: 0x0c,
+                    type_specific_flags: 0x03,
                     granularity: 0,
                     address_range: (0xA0000, 0xBFFFF),
                     translation_offset: 0,
-                    length: 0x20000
+                    length: 0x20000,
+                    revision_id: None,
+                    type_specific_attributes: None,
+                    resource_source_index: None,
+                    resource_source: None,
                 }),
                 Resource::AddressSpace(AddressSpaceDescriptor {
                     resource_type: AddressSpaceResourceType::MemoryRange,
                     is_maximum_address_fixed: true,
                     is_minimum_address_fixed: true,
                     decode_type: AddressSpaceDecodeType::Additive,
+                    general_flags: 0x0c,
+                    type_specific_flags: 0x01,
                     granularity: 0,
                     address_range: (0xE0000000, 0xFEBFFFFF),
                     translation_offset: 0,
-                    length: 0x1EC00000
+                    length: 0x1EC00000,
+                    revision_id: None,
+                    type_specific_attributes: None,
+                    resource_source_index: None,
+                    resource_source: None,
                 }),
             ])
         );
+    }
+
+    #[test]
+    fn parses_extended_address_space_descriptor_without_losing_window_values() {
+        let mut bytes = crate::aml_vec![0x8b, 0x35, 0, 0, 0x0c, 0x01, 1, 0];
+        for value in [0x0fff_u64, 0x1000_0000, 0x1fff_ffff, 0x1000, 0x1000_0000, 0xfeed_face_cafe_beef] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0x79, 0]);
+
+        let resources = resource_descriptor_list(Object::Buffer(bytes).wrap()).unwrap();
+        assert_eq!(resources.len(), 1);
+        let Resource::AddressSpace(window) = &resources[0] else {
+            panic!("expected extended address-space resource");
+        };
+        assert_eq!(window.resource_type, AddressSpaceResourceType::MemoryRange);
+        assert_eq!(window.general_flags, 0x0c);
+        assert_eq!(window.type_specific_flags, 0x01);
+        assert_eq!(window.address_range, (0x1000_0000, 0x1fff_ffff));
+        assert_eq!(window.translation_offset, 0x1000);
+        assert_eq!(window.length, 0x1000_0000);
+        assert_eq!(window.revision_id, Some(1));
+        assert_eq!(window.type_specific_attributes, Some(0xfeed_face_cafe_beef));
+    }
+
+    #[test]
+    fn preserves_vendor_address_space_type_without_panicking() {
+        let mut bytes = crate::aml_vec![0x8a, 0x2b, 0, 0xc0];
+        bytes.resize(46, 0);
+        bytes.extend_from_slice(&[0x79, 0]);
+
+        let resources = resource_descriptor_list(Object::Buffer(bytes).wrap()).unwrap();
+        let [Resource::AddressSpace(window)] = resources.as_slice() else {
+            panic!("expected one vendor-defined address-space descriptor");
+        };
+        assert_eq!(window.resource_type, AddressSpaceResourceType::VendorDefined(0xc0));
+    }
+
+    #[test]
+    fn rejects_reserved_dma_transfer_preference_without_panicking() {
+        let bytes = crate::aml_vec![0x2a, 0x01, 0x03, 0x79, 0];
+        assert!(resource_descriptor_list(Object::Buffer(bytes).wrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_large_resource_header_without_panicking() {
+        let bytes = crate::aml_vec![0x8a];
+        assert!(resource_descriptor_list(Object::Buffer(bytes).wrap()).is_err());
+    }
+
+    #[test]
+    fn single_bit_resource_descriptor_mutations_never_panic() {
+        let templates = [
+            crate::aml_vec![
+                0x47, 0x01, 0x60, 0x00, 0x60, 0x00, 0x01, 0x01, // IO
+                0x22, 0x02, 0x00, // IRQ
+                0x79, 0x00, // End tag
+            ],
+            {
+                let mut bytes = crate::aml_vec![0x8b, 0x35, 0, 0, 0x0c, 0x01, 1, 0];
+                for value in [0x0fff_u64, 0x1000_0000, 0x1fff_ffff, 0x1000, 0x1000_0000, 0xfeed_face_cafe_beef] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                bytes.extend_from_slice(&[0x79, 0]);
+                bytes
+            },
+        ];
+
+        for (template_index, template) in templates.iter().enumerate() {
+            for byte_index in 0..template.len() {
+                for bit in 0..u8::BITS {
+                    let mut mutated = template.clone();
+                    mutated[byte_index] ^= 1_u8 << bit;
+
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        resource_descriptor_list(Object::Buffer(mutated).wrap())
+                    }));
+                    assert!(
+                        outcome.is_ok(),
+                        "resource mutation panicked: template={template_index}, byte={byte_index}, bit={bit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_large_resource_length_overrun_without_panicking() {
+        let bytes = crate::aml_vec![0x8a, 0x2b, 0x00];
+        assert!(resource_descriptor_list(Object::Buffer(bytes).wrap()).is_err());
     }
 
     #[test]
@@ -1049,7 +1516,7 @@ mod tests {
 
         assert_eq!(
             resources,
-            Vec::from([Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation {
+            allocator::vec_from_array([Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation {
                 is_writable: true,
                 base_address: 0x1000,
                 range_length: 0x1000,
@@ -1072,12 +1539,117 @@ mod tests {
 
         assert_eq!(
             resources,
-            Vec::from([Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation {
+            allocator::vec_from_array([Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation {
                 is_writable: true,
                 base_address: 0x1000,
                 range_length: 0x1000,
             })])
         );
+    }
+
+    #[test]
+    fn metered_parser_charges_unsupported_descriptors_before_scanning_all_input() {
+        const DESCRIPTOR_COUNT: usize = 4096;
+        let mut bytes = allocator::vec_new();
+        bytes.try_reserve_exact(DESCRIPTOR_COUNT * 2).unwrap();
+        for _ in 0..DESCRIPTOR_COUNT {
+            bytes.extend_from_slice(&[0x71, 0x00]); // Unsupported vendor descriptor.
+        }
+        let meter = LoopBudgetMeter {
+            maximum_iterations: 8,
+            iterations: AtomicUsize::new(0),
+            deadline_checks: AtomicUsize::new(0),
+            reject_deadline: false,
+        };
+
+        let result = resource_descriptor_list_metered(Object::Buffer(bytes).wrap(), &meter);
+
+        assert_eq!(result, Err(AmlError::BudgetExceeded));
+        assert_eq!(meter.iterations.load(Ordering::Relaxed), 9);
+        assert_eq!(meter.deadline_checks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metered_parser_checks_deadline_during_long_descriptor_scans() {
+        const DESCRIPTOR_COUNT: usize = 1024;
+        let mut bytes = allocator::vec_new();
+        bytes.try_reserve_exact(DESCRIPTOR_COUNT * 2).unwrap();
+        for _ in 0..DESCRIPTOR_COUNT {
+            bytes.extend_from_slice(&[0x71, 0x00]);
+        }
+        let meter = LoopBudgetMeter {
+            maximum_iterations: DESCRIPTOR_COUNT,
+            iterations: AtomicUsize::new(0),
+            deadline_checks: AtomicUsize::new(0),
+            reject_deadline: true,
+        };
+
+        let result = resource_descriptor_list_metered(Object::Buffer(bytes).wrap(), &meter);
+
+        assert_eq!(result, Err(AmlError::DeadlineExceeded));
+        assert_eq!(meter.iterations.load(Ordering::Relaxed), RESOURCE_DEADLINE_SAMPLE_INTERVAL);
+        assert_eq!(meter.deadline_checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn metered_parser_checks_deadline_while_scanning_resource_source() {
+        const FIXED_DESCRIPTOR_BYTES: usize = 46;
+        const SOURCE_BYTES: usize = 1024;
+        let total_length = FIXED_DESCRIPTOR_BYTES + 1 + SOURCE_BYTES;
+        let mut bytes = crate::aml_vec![b'S'; total_length];
+        bytes[0] = 0x8a; // QWord Address Space descriptor.
+        let payload_length = (total_length - 3) as u16;
+        bytes[1..3].copy_from_slice(&payload_length.to_le_bytes());
+        bytes[3] = 0; // Memory resource.
+        bytes[4] = 0;
+        bytes[5] = 0;
+        bytes[FIXED_DESCRIPTOR_BYTES] = 0; // Resource Source Index.
+
+        let meter = LoopBudgetMeter {
+            maximum_iterations: SOURCE_BYTES,
+            iterations: AtomicUsize::new(0),
+            deadline_checks: AtomicUsize::new(0),
+            reject_deadline: true,
+        };
+
+        let result = resource_descriptor_list_metered(Object::Buffer(bytes).wrap(), &meter);
+
+        assert_eq!(result, Err(AmlError::DeadlineExceeded));
+        assert_eq!(meter.iterations.load(Ordering::Relaxed), RESOURCE_DEADLINE_SAMPLE_INTERVAL);
+        assert_eq!(meter.deadline_checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn metered_parser_charges_gpio_pin_scans() {
+        const PIN_COUNT: usize = 8;
+        let source_name_offset = 23 + PIN_COUNT * size_of::<u16>();
+        let total_length = source_name_offset + 1;
+        let mut bytes = crate::aml_vec![0; total_length];
+        bytes[0] = 0x8c;
+        let payload_length = (total_length - 3) as u16;
+        bytes[1..3].copy_from_slice(&payload_length.to_le_bytes());
+        bytes[3] = 1; // Revision.
+        bytes[4] = 1; // GPIO I/O connection.
+        bytes[9] = 0; // Default pin configuration.
+        bytes[14..16].copy_from_slice(&(23_u16).to_le_bytes());
+        bytes[17..19].copy_from_slice(&(source_name_offset as u16).to_le_bytes());
+        for index in 0..PIN_COUNT {
+            let pin_offset = 23 + index * size_of::<u16>();
+            bytes[pin_offset..pin_offset + 2].copy_from_slice(&(index as u16).to_le_bytes());
+        }
+
+        let meter = LoopBudgetMeter {
+            maximum_iterations: 4,
+            iterations: AtomicUsize::new(0),
+            deadline_checks: AtomicUsize::new(0),
+            reject_deadline: false,
+        };
+
+        let result = resource_descriptor_list_metered(Object::Buffer(bytes).wrap(), &meter);
+
+        assert_eq!(result, Err(AmlError::BudgetExceeded));
+        assert_eq!(meter.iterations.load(Ordering::Relaxed), 5);
+        assert_eq!(meter.deadline_checks.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1120,7 +1692,7 @@ mod tests {
 
         assert_eq!(
             resources,
-            Vec::from([
+            allocator::vec_from_array([
                 Resource::IOPort(IOPortDescriptor {
                     decodes_full_address: true,
                     memory_range: (0x03F2, 0x03F2),
